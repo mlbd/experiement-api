@@ -301,6 +301,7 @@ def analyze_image_for_bg_removal(img: Image.Image):
         or (edge_sharpness > 35.0)
     )
 
+
     return {
         "has_solid_bg": has_solid_bg,
         "bg_color": tuple(int(x) for x in bg),
