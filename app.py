@@ -866,6 +866,10 @@ def remove_bg_endpoint():
         do_trim = request.form.get("trim", "true").lower() == "true"
         output_format = request.form.get("output_format", "png").strip().lower()
         do_enhance_second = request.form.get("enhance_second", "false").lower() == "true"
+        enhance_second_mode = request.form.get("enhance_second_mode", "fal").strip().lower()
+        # allowed: fal | skip_fal | local
+        if enhance_second_mode not in ("fal", "skip_fal", "local"):
+            enhance_second_mode = "fal"
 
         bg_remove = request.form.get("bg_remove", "auto").strip().lower()
         allowed_bg = {"auto", "ai", "color", "skip"}
@@ -953,34 +957,47 @@ def remove_bg_endpoint():
         enhance_second_msg = "not requested"
 
         if do_enhance_second:
-            # keep a copy for alpha restoration if fal flattens transparency
             before_second = result_img.convert("RGBA")
 
-            # fal expects bytes; send current transparent png
-            tmp_bytes = pil_to_png_bytes(before_second)
-            second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
+            if enhance_second_mode == "skip_fal":
+                # TEST: don't change image, just run the 2nd-pass cleanup steps
+                enhanced_second = False
+                enhance_second_msg = "skip_fal_test_mode"
+                enh_img = before_second
 
-            if enhanced_second and second_bytes:
-                enh_img = _open_image_bytes(second_bytes)
+            elif enhance_second_mode == "local":
+                # TEST: local upscale instead of fal (closest offline test)
+                enh_img, up_meta = local_upscale_for_logo(before_second, target_max=1200)
+                enhanced_second = bool(up_meta.get("applied", False))
+                enhance_second_msg = f"local_upscale:{up_meta}"
+                log("enhance_local_second", success=True, **up_meta)
 
-                # restore alpha if missing (many upscalers flatten)
-                result_img = restore_alpha_if_missing(enh_img, before_second)
-
-                # upscale can reintroduce edge halos -> run these again lightly
-                bg_rgb = analysis.get("bg_color") or (255, 255, 255)
-                result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
-                log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
-
-                result_img = _decontaminate_edges(result_img, bg_rgb)
-                log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
-
-                result_img = soften_alpha_edge(result_img, radius_px=1)
-                log("soften_alpha_edge_2", success=True, radius_px=1)
-
-                log("enhance_fal_second", success=True, applied=True, message=str(enhance_second_msg),
-                    out_size=f"{result_img.width}x{result_img.height}")
             else:
-                log("enhance_fal_second", success=True, applied=False, message=str(enhance_second_msg))
+                # REAL: call fal
+                tmp_bytes = pil_to_png_bytes(before_second)
+                second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
+
+                if enhanced_second and second_bytes:
+                    enh_img = _open_image_bytes(second_bytes)
+                else:
+                    enh_img = before_second
+
+            # Apply the same helper pipeline (even in skip/local mode)
+            result_img = restore_alpha_if_missing(enh_img, before_second)
+
+            bg_rgb = analysis.get("bg_color") or (255, 255, 255)
+            result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
+            log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
+
+            result_img = _decontaminate_edges(result_img, bg_rgb)
+            log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
+
+            result_img = soften_alpha_edge(result_img, radius_px=1)
+            log("soften_alpha_edge_2", success=True, radius_px=1)
+
+            log("enhance_second", success=True, mode=enhance_second_mode, applied=bool(enhanced_second), message=str(enhance_second_msg),
+                out_size=f"{result_img.width}x{result_img.height}")
+
 
 
         # trim
