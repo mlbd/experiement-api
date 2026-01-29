@@ -309,6 +309,40 @@ def remove_inner_bg_holes(alpha_u8: np.ndarray, cand_bg: np.ndarray, max_area_ra
 
     return out
 
+def pil_to_png_bytes(img_rgba: Image.Image) -> bytes:
+    buf = BytesIO()
+    img_rgba.convert("RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+def _has_alpha(img: Image.Image) -> bool:
+    if img.mode in ("RGBA", "LA"):
+        return True
+    return False
+
+def restore_alpha_if_missing(enhanced: Image.Image, alpha_src: Image.Image) -> Image.Image:
+    """
+    If enhanced output loses alpha, restore alpha from alpha_src (resized).
+    """
+    enh = enhanced.convert("RGBA")
+    # If enhanced already has meaningful alpha, keep it
+    a = np.array(enh.getchannel("A"))
+    if np.any(a < 255):
+        return enh
+
+    # Restore alpha from source
+    src = alpha_src.convert("RGBA")
+    src_a = src.getchannel("A")
+
+    try:
+        resample = Image.Resampling.LANCZOS
+    except Exception:
+        resample = Image.LANCZOS
+
+    src_a_rs = src_a.resize(enh.size, resample=resample)
+    out = enh.copy()
+    out.putalpha(src_a_rs)
+    return out
+
 
 def cleanup_edge_spill(img_rgba: Image.Image, bg_rgb=(255, 255, 255), band_px=2, dist_thresh=26, gamma=1.6):
     """
@@ -838,7 +872,10 @@ def remove_bg_endpoint():
             log("read_params", success=False, reason="invalid_bg_remove", received=bg_remove)
             return json_error({"error": "Invalid bg_remove value", "allowed": sorted(list(allowed_bg))}, status=400)
 
-        log("read_params", success=True, enhance=do_enhance, trim=do_trim, output_format=output_format, bg_remove=bg_remove)
+        log("read_params", success=True,
+            enhance=do_enhance, enhance_second=do_enhance_second,
+            trim=do_trim, output_format=output_format, bg_remove=bg_remove
+        )
 
         # already transparent?
         try:
@@ -911,6 +948,40 @@ def remove_bg_endpoint():
         result_img = soften_alpha_edge(result_img, radius_px=1)
         log("soften_alpha_edge", success=True, radius_px=1)
 
+        enhanced_second = False
+        enhance_second_msg = "not requested"
+
+        if do_enhance_second:
+            # keep a copy for alpha restoration if fal flattens transparency
+            before_second = result_img.convert("RGBA")
+
+            # fal expects bytes; send current transparent png
+            tmp_bytes = pil_to_png_bytes(before_second)
+            second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
+
+            if enhanced_second and second_bytes:
+                enh_img = _open_image_bytes(second_bytes)
+
+                # restore alpha if missing (many upscalers flatten)
+                result_img = restore_alpha_if_missing(enh_img, before_second)
+
+                # upscale can reintroduce edge halos -> run these again lightly
+                bg_rgb = analysis.get("bg_color") or (255, 255, 255)
+                result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
+                log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
+
+                result_img = _decontaminate_edges(result_img, bg_rgb)
+                log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
+
+                result_img = soften_alpha_edge(result_img, radius_px=1)
+                log("soften_alpha_edge_2", success=True, radius_px=1)
+
+                log("enhance_fal_second", success=True, applied=True, message=str(enhance_second_msg),
+                    out_size=f"{result_img.width}x{result_img.height}")
+            else:
+                log("enhance_fal_second", success=True, applied=False, message=str(enhance_second_msg))
+
+
         # trim
         if do_trim:
             result_img = trim_transparent(result_img, padding=2)
@@ -947,6 +1018,8 @@ def remove_bg_endpoint():
         resp.headers["X-Fallback-Used"] = str(bool(fallback_used))
         resp.headers["X-Enhanced"] = str(bool(enhanced))
         resp.headers["X-Enhance-Status"] = str(enhance_msg)
+        resp.headers["X-Enhanced-Second"] = str(bool(enhanced_second))
+        resp.headers["X-Enhance-Second-Status"] = str(enhance_second_msg)
         resp.headers["X-Trimmed"] = str(bool(do_trim))
         resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
         resp.headers["X-Output-Size"] = f"{result_img.width}x{result_img.height}"
