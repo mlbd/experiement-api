@@ -865,6 +865,7 @@ def remove_bg_endpoint():
         do_enhance = request.form.get("enhance", "false").lower() == "true"
         do_trim = request.form.get("trim", "true").lower() == "true"
         output_format = request.form.get("output_format", "png").strip().lower()
+        do_enhance_second = request.form.get("enhance_second", "false").lower() == "true"
 
         bg_remove = request.form.get("bg_remove", "auto").strip().lower()
         allowed_bg = {"auto", "ai", "color", "skip"}
