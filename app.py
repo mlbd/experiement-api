@@ -68,6 +68,38 @@ def _enforce_only_image_field():
         }), 400
     return None
 
+def sharpen_rgb_keep_alpha(img_rgba: Image.Image, amount=1.1, radius=1.2, threshold=2):
+    """
+    Unsharp mask on RGB only (alpha preserved).
+    amount: 1.05–1.25 usually safe for logos
+    radius: 1.0–1.6 for small images
+    threshold: 0–5 to avoid boosting noise
+    """
+    img = img_rgba.convert("RGBA")
+    arr = np.array(img, dtype=np.uint8)
+
+    rgb = arr[:, :, :3].astype(np.float32)
+    a   = arr[:, :, 3:4]  # keep alpha as-is
+
+    # blur RGB
+    k = int(max(1, round(radius * 2 + 1)))
+    if k % 2 == 0:
+        k += 1
+    blur = cv2.GaussianBlur(rgb, (k, k), 0)
+
+    # unsharp mask: rgb + amount*(rgb - blur)
+    diff = rgb - blur
+
+    # threshold: only sharpen where diff is significant
+    if threshold > 0:
+        m = (np.max(np.abs(diff), axis=2, keepdims=True) >= threshold).astype(np.float32)
+        diff = diff * m
+
+    sharp = np.clip(rgb + (amount * diff), 0, 255).astype(np.uint8)
+
+    out = np.concatenate([sharp, a], axis=2)
+    return Image.fromarray(out, "RGBA")
+
 
 # -----------------------------
 # UTIL: IO / TRANSPARENCY
@@ -782,6 +814,12 @@ def remove_bg_endpoint():
         # feather (small)
         result_img = refine_edges(result_img, feather_amount=2)
         log("refine_edges", success=True)
+
+        # Sharpen only when we used enhance (fal upscaling tends to soften edges)
+        if enhanced:
+            result_img = sharpen_rgb_keep_alpha(result_img, amount=1.12, radius=1.3, threshold=2)
+            log("sharpen", success=True, amount=1.12, radius=1.3, threshold=2)
+
 
         # trim
         if do_trim:
