@@ -68,38 +68,6 @@ def _enforce_only_image_field():
         }), 400
     return None
 
-def sharpen_rgb_keep_alpha(img_rgba: Image.Image, amount=1.1, radius=1.2, threshold=2):
-    """
-    Unsharp mask on RGB only (alpha preserved).
-    amount: 1.05–1.25 usually safe for logos
-    radius: 1.0–1.6 for small images
-    threshold: 0–5 to avoid boosting noise
-    """
-    img = img_rgba.convert("RGBA")
-    arr = np.array(img, dtype=np.uint8)
-
-    rgb = arr[:, :, :3].astype(np.float32)
-    a   = arr[:, :, 3:4]  # keep alpha as-is
-
-    # blur RGB
-    k = int(max(1, round(radius * 2 + 1)))
-    if k % 2 == 0:
-        k += 1
-    blur = cv2.GaussianBlur(rgb, (k, k), 0)
-
-    # unsharp mask: rgb + amount*(rgb - blur)
-    diff = rgb - blur
-
-    # threshold: only sharpen where diff is significant
-    if threshold > 0:
-        m = (np.max(np.abs(diff), axis=2, keepdims=True) >= threshold).astype(np.float32)
-        diff = diff * m
-
-    sharp = np.clip(rgb + (amount * diff), 0, 255).astype(np.uint8)
-
-    out = np.concatenate([sharp, a], axis=2)
-    return Image.fromarray(out, "RGBA")
-
 
 # -----------------------------
 # UTIL: IO / TRANSPARENCY
@@ -267,7 +235,61 @@ def enhance_image_fal(image_bytes: bytes, wait_timeout=120, poll_interval=1.5):
 
 
 # -----------------------------
-# ANALYSIS (auto decision)
+# SHARPEN (RGB only) + ALPHA EDGE SOFTEN
+# -----------------------------
+def sharpen_rgb_keep_alpha(img_rgba: Image.Image, amount=1.10, radius=1.2, threshold=3):
+    """
+    Unsharp mask on RGB only (alpha preserved).
+    Safer for logos after upscaling. Keeps transparency clean.
+    """
+    img = img_rgba.convert("RGBA")
+    arr = np.array(img, dtype=np.uint8)
+
+    rgb = arr[:, :, :3].astype(np.float32)
+    a = arr[:, :, 3:4]  # keep alpha
+
+    k = int(max(1, round(radius * 2 + 1)))
+    if k % 2 == 0:
+        k += 1
+    blur = cv2.GaussianBlur(rgb, (k, k), 0)
+
+    diff = rgb - blur
+    if threshold > 0:
+        m = (np.max(np.abs(diff), axis=2, keepdims=True) >= threshold).astype(np.float32)
+        diff = diff * m
+
+    sharp = np.clip(rgb + (amount * diff), 0, 255).astype(np.uint8)
+    out = np.concatenate([sharp, a], axis=2)
+    return Image.fromarray(out, "RGBA")
+
+
+def soften_alpha_edge(img_rgba: Image.Image, radius_px: int = 1):
+    """
+    Smooth alpha only where it's partially transparent (edge band).
+    Helps reduce tiny jaggies without blurring solid areas.
+    """
+    img = img_rgba.convert("RGBA")
+    arr = np.array(img, dtype=np.uint8)
+    a = arr[:, :, 3]
+
+    edge = (a > 0) & (a < 255)
+    if not edge.any() or radius_px <= 0:
+        return img
+
+    k = radius_px * 2 + 1
+    if k % 2 == 0:
+        k += 1
+
+    blurred = cv2.GaussianBlur(a.astype(np.float32), (k, k), 0)
+    a2 = a.astype(np.float32)
+    a2[edge] = blurred[edge]
+
+    arr[:, :, 3] = np.clip(a2, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
+# -----------------------------
+# ANALYSIS (auto decision) - CORNERS MODE
 # -----------------------------
 def _estimate_bg_color_corners_mode(rgb_u8: np.ndarray, corner_px: int):
     h, w = rgb_u8.shape[:2]
@@ -280,7 +302,6 @@ def _estimate_bg_color_corners_mode(rgb_u8: np.ndarray, corner_px: int):
 
     px = np.concatenate([c1, c2, c3, c4], axis=0)
 
-    # quantize + mode (robust against JPG noise)
     q = (px // 16).astype(np.int16)
     keys = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
     vals, counts = np.unique(keys, return_counts=True)
@@ -293,46 +314,35 @@ def _estimate_bg_color_corners_mode(rgb_u8: np.ndarray, corner_px: int):
     bg = np.array([r, g, bq], dtype=np.float32) * 16.0 + 8.0
     return bg.astype(np.uint8)
 
+
 def analyze_image_for_bg_removal(img: Image.Image):
     img_rgb = img.convert("RGB")
     data = np.array(img_rgb, dtype=np.uint8)
     h, w = data.shape[:2]
 
-    # Corner-based bg estimate (works even if logo touches edges)
     corner_px = max(6, min(32, h // 12, w // 12))
     bg = _estimate_bg_color_corners_mode(data, corner_px=corner_px)
 
-    # bg coverage by LAB distance
     lab = cv2.cvtColor(data, cv2.COLOR_RGB2LAB).astype(np.int16)
     bg_lab = cv2.cvtColor(bg.reshape(1, 1, 3), cv2.COLOR_RGB2LAB)[0, 0].astype(np.int16)
     d = lab - bg_lab[None, None, :]
     dist = np.sqrt((d[:, :, 0] ** 2) + (d[:, :, 1] ** 2) + (d[:, :, 2] ** 2)).astype(np.float32)
 
-    # tolerant threshold for JPG backgrounds
     bg_coverage = float(np.mean(dist < 22.0))
 
-    # color complexity (downsample)
     small = cv2.resize(data, (max(32, w // 10), max(32, h // 10)), interpolation=cv2.INTER_AREA)
     pixels = small.reshape(-1, 3)
     unique_colors = len(np.unique(pixels, axis=0))
     color_complexity = float(unique_colors / max(1, pixels.shape[0]))
 
-    # edge sharpness
     gray = cv2.cvtColor(data, cv2.COLOR_RGB2GRAY)
     sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(sx, sy)
     edge_sharpness = float(np.mean(mag))
 
-    # solid-bg decision should be based on coverage, not border consistency
-    has_solid_bg = bg_coverage >= 0.20  # logos often still <0.6 because of big text
-
-    # graphic decision: high edges OR solid bg usually means logo/graphic
-    is_graphic = bool(
-        has_solid_bg
-        or (edge_sharpness > 35.0)
-    )
-
+    has_solid_bg = bg_coverage >= 0.20
+    is_graphic = bool(has_solid_bg or (edge_sharpness > 35.0))
 
     return {
         "has_solid_bg": has_solid_bg,
@@ -342,7 +352,6 @@ def analyze_image_for_bg_removal(img: Image.Image):
         "color_complexity": color_complexity,
         "edge_sharpness": edge_sharpness,
     }
-
 
 
 # -----------------------------
@@ -364,13 +373,13 @@ def trim_transparent(img: Image.Image, padding: int = 2) -> Image.Image:
 
 
 # -----------------------------
-# EDGE FEATHER + DECONTAMINATION (NO "bleeding" defringe)
+# DECONTAMINATION + EDGE FEATHER
 # -----------------------------
 def _decontaminate_edges(img_rgba: Image.Image, bg_rgb_u8):
     """
     Unmix RGB from background on semi-transparent edge pixels:
       observed = fg*a + bg*(1-a)  ->  fg = (observed - bg*(1-a)) / a
-    This removes halos WITHOUT dilating/painting new pixels.
+    Removes halos WITHOUT dilating/painting pixels.
     """
     bg = np.array(bg_rgb_u8, dtype=np.float32).reshape(1, 1, 3)
 
@@ -383,7 +392,7 @@ def _decontaminate_edges(img_rgba: Image.Image, bg_rgb_u8):
     rgb_unmixed = np.clip(rgb_unmixed, 0, 255)
 
     rgb = np.where(mask, rgb_unmixed, rgb)
-    rgb = np.where(a == 0.0, 0.0, rgb)  # clean fully-transparent RGB
+    rgb = np.where(a == 0.0, 0.0, rgb)
 
     data[:, :, :3] = rgb
     return Image.fromarray(data.astype(np.uint8), "RGBA")
@@ -405,7 +414,7 @@ def refine_edges(img: Image.Image, feather_amount: int = 2) -> Image.Image:
 
 
 # -----------------------------
-# BG COLOR ESTIMATION: BORDER MODE (safer than median)
+# BG COLOR ESTIMATION: BORDER MODE (backup)
 # -----------------------------
 def _estimate_bg_color_border_mode(rgb_u8: np.ndarray, border_px: int):
     h, w = rgb_u8.shape[:2]
@@ -418,8 +427,7 @@ def _estimate_bg_color_border_mode(rgb_u8: np.ndarray, border_px: int):
 
     border = np.concatenate([top, bottom, left, right], axis=0)
 
-    # quantize to reduce noise; compute mode
-    q = (border // 16).astype(np.int16)  # 0..15
+    q = (border // 16).astype(np.int16)
     keys = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
     vals, counts = np.unique(keys, return_counts=True)
     mode_key = int(vals[np.argmax(counts)])
@@ -428,14 +436,12 @@ def _estimate_bg_color_border_mode(rgb_u8: np.ndarray, border_px: int):
     g = (mode_key >> 4) & 0x0F
     bq = mode_key & 0x0F
 
-    # convert back to 0..255 (center of bin)
-    bg = np.array([r, g, bq], dtype=np.float32)
-    bg = bg * 16.0 + 8.0
+    bg = np.array([r, g, bq], dtype=np.float32) * 16.0 + 8.0
     return bg.astype(np.uint8)
 
 
 # -----------------------------
-# BG REMOVAL: COLOR (solid bg) - V3 (black/white safe)
+# BG REMOVAL: COLOR (solid bg) - V3
 # -----------------------------
 def _lab_dist(rgb_u8: np.ndarray, bg_rgb_u8: np.ndarray):
     lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.int16)
@@ -448,12 +454,7 @@ def _lab_dist(rgb_u8: np.ndarray, bg_rgb_u8: np.ndarray):
 def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
     """
     Solid-bg removal that won't eat dark colored strokes on black backgrounds.
-
-    - bg estimated via BORDER MODE (quantized) unless provided
-    - if bg is near-black or near-white: use LAB chroma guard
-    - background is ONLY border-connected (connected components)
-    - creates soft alpha edge
-    - decontaminates halos using bg color
+    Background is only border-connected. Includes soft edge + decontamination.
     """
     pil = img.convert("RGBA")
     rgba = np.array(pil, dtype=np.uint8)
@@ -467,36 +468,30 @@ def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
     else:
         bg_rgb = np.array(bg_color, dtype=np.uint8)
 
-    # Cap tolerance for logos (prevents "eating" dark strokes)
     tol = int(np.clip(tolerance, 8, 26))
 
     lab, dist = _lab_dist(rgb, bg_rgb.astype(np.uint8))
 
     L = lab[:, :, 0].astype(np.int16)
-    a = lab[:, :, 1].astype(np.int16) - 128
-    b = lab[:, :, 2].astype(np.int16) - 128
-    chroma = np.sqrt((a.astype(np.float32) ** 2) + (b.astype(np.float32) ** 2))
+    aa = lab[:, :, 1].astype(np.int16) - 128
+    bb = lab[:, :, 2].astype(np.int16) - 128
+    chroma = np.sqrt((aa.astype(np.float32) ** 2) + (bb.astype(np.float32) ** 2))
 
-    # Detect near-black / near-white bg
     bg_sum = int(bg_rgb[0]) + int(bg_rgb[1]) + int(bg_rgb[2])
     near_black = bg_sum <= 60
     near_white = bg_sum >= (255 * 3 - 60)
 
     if near_black:
-        # Background black tends to have low L and low chroma
         cand = (L <= 55) & (chroma <= 16.0)
     elif near_white:
-        # Background white tends to have high L and low chroma
         cand = (L >= 200) & (chroma <= 18.0)
     else:
         cand = dist <= float(tol)
 
     cand_u8 = cand.astype(np.uint8)
 
-    # Connected components, keep labels that touch the border as background
     num, labels = cv2.connectedComponents(cand_u8, connectivity=8)
     if num <= 1:
-        # no background detected
         out = pil.copy()
         meta = {"bg_rgb": tuple(int(x) for x in bg_rgb), "tolerance": tol, "reason": "no_components"}
         return out, meta
@@ -513,23 +508,19 @@ def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
 
     bg_mask = np.isin(labels, border_labels)
 
-    # Alpha: background -> 0
     alpha = np.full((h, w), 255, dtype=np.uint8)
     alpha[bg_mask] = 0
 
-    # Soft edge only near boundary
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bg_dil = cv2.dilate(bg_mask.astype(np.uint8), k, iterations=1).astype(bool)
     edge_zone = bg_dil & (~bg_mask)
 
-    # For non-black/white we can use distance to soften; for black/white use chroma/L to soften
     feather = 12.0
     if not (near_black or near_white):
         soft = edge_zone & (dist < (float(tol) + feather))
         a_soft = ((dist[soft] - float(tol)) / feather) * 255.0
         alpha[soft] = np.clip(a_soft, 0, 255).astype(np.uint8)
     else:
-        # soften based on L/chroma instead of dist
         if near_black:
             soft = edge_zone & (L < 80)
             a_soft = ((L[soft].astype(np.float32) - 55.0) / 25.0) * 255.0
@@ -542,7 +533,6 @@ def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
     out[:, :, 3] = alpha
     out_img = Image.fromarray(out, "RGBA")
 
-    # Decontaminate halos
     out_img = _decontaminate_edges(out_img, bg_rgb)
 
     meta = {
@@ -623,7 +613,6 @@ def _score_result(img_rgba: Image.Image):
     content = float(np.mean(a > 20))
     corner_t = _corners_transparent_ratio(img_rgba)
 
-    # Penalize extreme content ratios
     penalty = 0.0
     if content < 0.02:
         penalty += (0.02 - content) * 4.0
@@ -635,20 +624,18 @@ def _score_result(img_rgba: Image.Image):
 
 def remove_bg_auto_v3(img: Image.Image, analysis: dict):
     """
-    Stable AUTO:
-    - If corners indicate a dominant background (bg_coverage >= 0.20), use color removal (not AI)
+    AUTO:
+    - If bg_coverage looks dominant (>= 0.20) or it's graphic: prefer color remover
     - Otherwise use AI
     """
     is_graphic = bool(analysis.get("is_graphic", False))
     bg_coverage = float(analysis.get("bg_coverage", 0.0))
 
-    # For logos/graphics, prefer color if we can estimate bg (we can now)
     if is_graphic or bg_coverage >= 0.20:
         best = None
         best_meta = None
         best_score = -1e9
 
-        # keep tolerances conservative to avoid eating dark strokes
         for tol in (10, 12, 14, 16, 18, 20, 22):
             out, meta = remove_bg_color_method_v3(
                 img,
@@ -670,16 +657,13 @@ def remove_bg_auto_v3(img: Image.Image, analysis: dict):
 
         corner_t = _corners_transparent_ratio(best)
         if corner_t < 0.70:
-            # fallback to AI only if color clearly failed
             ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
             return ai, "ai_rembg_fallback", True, {"picked": "ai", "ai_meta": ai_meta, "color_meta": best_meta}
 
         return best, "color_v3_auto_pick", False, {"picked": "color", "color_meta": best_meta, "score": best_score}
 
-    # Photo-like: AI
     ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
     return ai, "ai_rembg_auto", False, {"picked": "ai", "ai_meta": ai_meta}
-
 
 
 # -----------------------------
@@ -770,7 +754,7 @@ def remove_bg_endpoint():
             already_transparent = False
             log("check_transparency", success=False, error=str(e), already_transparent=False)
 
-        # optional enhance (can be nondeterministic)
+        # optional enhance
         enhanced = False
         enhance_msg = "not requested"
         if do_enhance:
@@ -815,11 +799,19 @@ def remove_bg_endpoint():
         result_img = refine_edges(result_img, feather_amount=2)
         log("refine_edges", success=True)
 
-        # Sharpen only when we used enhance (fal upscaling tends to soften edges)
+        # sharpen only when enhanced (upscale softens edges)
         if enhanced:
-            result_img = sharpen_rgb_keep_alpha(result_img, amount=1.12, radius=1.3, threshold=2)
-            log("sharpen", success=True, amount=1.12, radius=1.3, threshold=2)
+            result_img = sharpen_rgb_keep_alpha(result_img, amount=1.10, radius=1.2, threshold=3)
+            log("sharpen", success=True, amount=1.10, radius=1.2, threshold=3)
 
+        # FINAL halo cleanup AFTER refine/sharpen (important)
+        bg_rgb = analysis.get("bg_color") or (255, 255, 255)
+        result_img = _decontaminate_edges(result_img, bg_rgb)
+        log("decontaminate_final", success=True, bg_rgb=bg_rgb)
+
+        # tiny edge smooth to reduce jaggies
+        result_img = soften_alpha_edge(result_img, radius_px=1)
+        log("soften_alpha_edge", success=True, radius_px=1)
 
         # trim
         if do_trim:
