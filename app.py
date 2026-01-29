@@ -237,71 +237,79 @@ def enhance_image_fal(image_bytes: bytes, wait_timeout=120, poll_interval=1.5):
 # -----------------------------
 # ANALYSIS (auto decision)
 # -----------------------------
+def _estimate_bg_color_corners_mode(rgb_u8: np.ndarray, corner_px: int):
+    h, w = rgb_u8.shape[:2]
+    cs = int(max(3, min(corner_px, h // 3, w // 3)))
+
+    c1 = rgb_u8[0:cs, 0:cs, :].reshape(-1, 3)
+    c2 = rgb_u8[0:cs, w - cs:w, :].reshape(-1, 3)
+    c3 = rgb_u8[h - cs:h, 0:cs, :].reshape(-1, 3)
+    c4 = rgb_u8[h - cs:h, w - cs:w, :].reshape(-1, 3)
+
+    px = np.concatenate([c1, c2, c3, c4], axis=0)
+
+    # quantize + mode (robust against JPG noise)
+    q = (px // 16).astype(np.int16)
+    keys = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
+    vals, counts = np.unique(keys, return_counts=True)
+    mode_key = int(vals[np.argmax(counts)])
+
+    r = (mode_key >> 8) & 0xFF
+    g = (mode_key >> 4) & 0x0F
+    bq = mode_key & 0x0F
+
+    bg = np.array([r, g, bq], dtype=np.float32) * 16.0 + 8.0
+    return bg.astype(np.uint8)
+
 def analyze_image_for_bg_removal(img: Image.Image):
     img_rgb = img.convert("RGB")
-    data = np.array(img_rgb)
+    data = np.array(img_rgb, dtype=np.uint8)
     h, w = data.shape[:2]
 
-    analysis = {
-        "has_solid_bg": False,
-        "bg_color": None,
-        "bg_coverage": 0.0,
-        "is_graphic": False,
-        "color_complexity": 0.0,
-        "edge_sharpness": 0.0,
-    }
+    # Corner-based bg estimate (works even if logo touches edges)
+    corner_px = max(6, min(32, h // 12, w // 12))
+    bg = _estimate_bg_color_corners_mode(data, corner_px=corner_px)
 
-    cs = max(6, min(40, h // 15, w // 15))
-    border_samples = [
-        data[0:cs, 0:cs],
-        data[0:cs, w - cs:w],
-        data[h - cs:h, 0:cs],
-        data[h - cs:h, w - cs:w],
-        data[0:cs, w // 2 - cs // 2:w // 2 + cs // 2],
-        data[h - cs:h, w // 2 - cs // 2:w // 2 + cs // 2],
-        data[h // 2 - cs // 2:h // 2 + cs // 2, 0:cs],
-        data[h // 2 - cs // 2:h // 2 + cs // 2, w - cs:w],
-    ]
+    # bg coverage by LAB distance
+    lab = cv2.cvtColor(data, cv2.COLOR_RGB2LAB).astype(np.int16)
+    bg_lab = cv2.cvtColor(bg.reshape(1, 1, 3), cv2.COLOR_RGB2LAB)[0, 0].astype(np.int16)
+    d = lab - bg_lab[None, None, :]
+    dist = np.sqrt((d[:, :, 0] ** 2) + (d[:, :, 1] ** 2) + (d[:, :, 2] ** 2)).astype(np.float32)
 
-    means = []
-    stds = []
-    for s in border_samples:
-        px = s.reshape(-1, 3).astype(np.float32)
-        means.append(px.mean(axis=0))
-        stds.append(px.std(axis=0).mean())
+    # tolerant threshold for JPG backgrounds
+    bg_coverage = float(np.mean(dist < 22.0))
 
-    means = np.array(means, dtype=np.float32)
-    stds = np.array(stds, dtype=np.float32)
-
-    mean_dist = float(np.mean(np.linalg.norm(means - np.mean(means, axis=0), axis=1)))
-    std_mean = float(np.mean(stds))
-
-    if mean_dist < 18 and std_mean < 22:
-        analysis["has_solid_bg"] = True
-        bg = np.median(means, axis=0)
-        analysis["bg_color"] = tuple(int(x) for x in bg)
-
-        bg_rgb = np.array(bg, dtype=np.float32)[None, None, :]
-        dist = np.linalg.norm(data.astype(np.float32) - bg_rgb, axis=2)
-        analysis["bg_coverage"] = float(np.mean(dist < max(18.0, std_mean * 1.3)))
-
+    # color complexity (downsample)
     small = cv2.resize(data, (max(32, w // 10), max(32, h // 10)), interpolation=cv2.INTER_AREA)
     pixels = small.reshape(-1, 3)
     unique_colors = len(np.unique(pixels, axis=0))
-    analysis["color_complexity"] = float(unique_colors / max(1, pixels.shape[0]))
+    color_complexity = float(unique_colors / max(1, pixels.shape[0]))
 
+    # edge sharpness
     gray = cv2.cvtColor(data, cv2.COLOR_RGB2GRAY)
     sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(sx, sy)
-    analysis["edge_sharpness"] = float(np.mean(mag))
+    edge_sharpness = float(np.mean(mag))
 
-    analysis["is_graphic"] = bool(
-        (analysis["color_complexity"] < 0.35 and analysis["edge_sharpness"] > 20)
-        or (analysis["has_solid_bg"] and analysis["color_complexity"] < 0.45)
+    # solid-bg decision should be based on coverage, not border consistency
+    has_solid_bg = bg_coverage >= 0.20  # logos often still <0.6 because of big text
+
+    # graphic decision: high edges OR solid bg usually means logo/graphic
+    is_graphic = bool(
+        has_solid_bg
+        or (edge_sharpness > 35.0)
     )
 
-    return analysis
+    return {
+        "has_solid_bg": has_solid_bg,
+        "bg_color": tuple(int(x) for x in bg),
+        "bg_coverage": bg_coverage,
+        "is_graphic": is_graphic,
+        "color_complexity": color_complexity,
+        "edge_sharpness": edge_sharpness,
+    }
+
 
 
 # -----------------------------
@@ -595,24 +603,26 @@ def _score_result(img_rgba: Image.Image):
 def remove_bg_auto_v3(img: Image.Image, analysis: dict):
     """
     Stable AUTO:
-    - for logos/solid bg: try color method at several tolerances, pick best
-    - fallback to AI only if corner transparency fails badly
+    - If corners indicate a dominant background (bg_coverage >= 0.20), use color removal (not AI)
+    - Otherwise use AI
     """
     is_graphic = bool(analysis.get("is_graphic", False))
-    has_solid = bool(analysis.get("has_solid_bg", False))
+    bg_coverage = float(analysis.get("bg_coverage", 0.0))
 
-    # Prefer color for logos/solid backgrounds
-    if is_graphic or has_solid:
+    # For logos/graphics, prefer color if we can estimate bg (we can now)
+    if is_graphic or bg_coverage >= 0.20:
         best = None
         best_meta = None
         best_score = -1e9
 
-        # tolerant list (kept low to prevent eating dark strokes)
-        for tol in (10, 12, 14, 16, 18, 20, 22, 24, 26):
-            out, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=tol)
-
-            # basic sanity: must remove at least a little
-            removed_ratio = meta.get("bg_removed_ratio", 0.0)
+        # keep tolerances conservative to avoid eating dark strokes
+        for tol in (10, 12, 14, 16, 18, 20, 22):
+            out, meta = remove_bg_color_method_v3(
+                img,
+                bg_color=analysis.get("bg_color"),
+                tolerance=tol
+            )
+            removed_ratio = float(meta.get("bg_removed_ratio", 0.0))
             if removed_ratio < 0.05:
                 continue
 
@@ -627,15 +637,16 @@ def remove_bg_auto_v3(img: Image.Image, analysis: dict):
 
         corner_t = _corners_transparent_ratio(best)
         if corner_t < 0.70:
-            # fallback to AI (rare for real logos, but helps complex bgs)
+            # fallback to AI only if color clearly failed
             ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
             return ai, "ai_rembg_fallback", True, {"picked": "ai", "ai_meta": ai_meta, "color_meta": best_meta}
 
         return best, "color_v3_auto_pick", False, {"picked": "color", "color_meta": best_meta, "score": best_score}
 
-    # Otherwise AI first
+    # Photo-like: AI
     ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
     return ai, "ai_rembg_auto", False, {"picked": "ai", "ai_meta": ai_meta}
+
 
 
 # -----------------------------
