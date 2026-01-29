@@ -309,6 +309,50 @@ def remove_inner_bg_holes(alpha_u8: np.ndarray, cand_bg: np.ndarray, max_area_ra
 
     return out
 
+def cleanup_edge_spill(img_rgba: Image.Image, bg_rgb=(255, 255, 255), band_px=2, dist_thresh=26, gamma=1.6):
+    """
+    Removes background-colored residue only near the transparency edge (safe).
+    - band_px: thickness around transparent area to treat as "edge band"
+    - dist_thresh: how close to bg color counts as spill (LAB distance)
+    - gamma: stronger falloff (higher = more aggressive)
+    """
+    img = img_rgba.convert("RGBA")
+    arr = np.array(img, dtype=np.uint8)
+    rgb = arr[:, :, :3]
+    a   = arr[:, :, 3].astype(np.uint8)
+
+    # Build an "edge band": pixels that are non-transparent but within band_px of transparency
+    trans = (a == 0).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (band_px * 2 + 1, band_px * 2 + 1))
+    near_trans = cv2.dilate(trans, k, iterations=1).astype(bool)
+    edge_band = near_trans & (a > 0)
+
+    if not np.any(edge_band):
+        return img
+
+    # LAB distance to bg
+    bg = np.array(bg_rgb, dtype=np.uint8).reshape(1, 1, 3)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.int16)
+    bg_lab = cv2.cvtColor(bg, cv2.COLOR_RGB2LAB)[0, 0].astype(np.int16)
+    d = lab - bg_lab[None, None, :]
+    dist = np.sqrt((d[:, :, 0] ** 2) + (d[:, :, 1] ** 2) + (d[:, :, 2] ** 2)).astype(np.float32)
+
+    # Only adjust alpha in edge band where color is close to bg
+    m = edge_band & (dist < float(dist_thresh))
+    if not np.any(m):
+        return img
+
+    # Scale alpha down based on distance (closer to bg => more transparent)
+    scale = np.clip(dist / float(dist_thresh), 0.0, 1.0) ** gamma
+    a2 = a.astype(np.float32)
+    a2[m] = a2[m] * scale[m]
+
+    # If extremely close to bg, kill it fully
+    a2[edge_band & (dist < float(dist_thresh) * 0.45)] = 0
+
+    arr[:, :, 3] = np.clip(a2, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
 
 def soften_alpha_edge(img_rgba: Image.Image, radius_px: int = 1):
     """
@@ -853,12 +897,16 @@ def remove_bg_endpoint():
             result_img = sharpen_rgb_keep_alpha(result_img, amount=1.10, radius=1.2, threshold=3)
             log("sharpen", success=True, amount=1.10, radius=1.2, threshold=3)
 
-        # FINAL halo cleanup AFTER refine/sharpen (important)
+        # 1) edge spill cleanup (alpha fix near transparency only)
         bg_rgb = analysis.get("bg_color") or (255, 255, 255)
+        result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
+        log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
+
+        # 2) then decontaminate (RGB fix)
         result_img = _decontaminate_edges(result_img, bg_rgb)
         log("decontaminate_final", success=True, bg_rgb=bg_rgb)
 
-        # tiny edge smooth to reduce jaggies
+        # 3) optional tiny alpha smoothing
         result_img = soften_alpha_edge(result_img, radius_px=1)
         log("soften_alpha_edge", success=True, radius_px=1)
 
