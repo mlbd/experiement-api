@@ -8,11 +8,15 @@ import base64
 import time
 import json
 from io import BytesIO
-
 import cv2
 import requests
+import zipfile
+import tempfile
+import ftplib
+import uuid
+from datetime import datetime
 
-# Optional (but likely in your requirements): rembg
+# Optional: rembg
 try:
     from rembg import new_session, remove as rembg_remove
 except Exception:
@@ -31,14 +35,24 @@ app = Flask(__name__)
 # -----------------------------
 # ENV / CONFIG
 # -----------------------------
-API_KEY = os.environ.get("API_KEY", None)
-FAL_KEY = os.environ.get("FAL_KEY", None)
+API_KEY = os.environ.get('API_KEY', None)
+FAL_KEY = os.environ.get('FAL_KEY', None)
+FAL_API_KEY = os.environ.get('FAL_API_KEY', None)  # For image enhancement
 
-MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_MB", 10)) * 1024 * 1024
-DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
-app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
+# FTP Configuration
+FTP_HOST = os.environ.get('FTP_HOST', None)
+FTP_USER = os.environ.get('FTP_USER', None)
+FTP_PASS = os.environ.get('FTP_PASS', None)
+FTP_DIR = os.environ.get('FTP_DIR', '/logos')  # Remote directory to upload to
+FTP_BASE_URL = os.environ.get('FTP_BASE_URL', None)  # Public URL base
 
-REMBG_MODEL = os.environ.get("REMBG_MODEL", "isnet-general-use")
+MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE_MB', 10)) * 1024 * 1024
+DEFAULT_THRESHOLD = int(os.environ.get('DEFAULT_THRESHOLD', 100))
+DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+REMBG_MODEL = os.environ.get('REMBG_MODEL', 'isnet-general-use')
 REMBG_SESSION = None
 
 
