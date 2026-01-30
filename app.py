@@ -110,6 +110,66 @@ def has_transparency(img_bytes: bytes) -> bool:
 def _img_bytes_has_transparency(img_bytes: bytes) -> bool:
     return has_transparency(img_bytes)
 
+# --------------------------------------------------------
+# COMMON IMAGE HELPERS (COPIED FROM my.py)
+# --------------------------------------------------------
+
+def _open_image(file_storage):
+    """COPIED from my.py – opens uploaded image safely"""
+    img = Image.open(file_storage.stream)
+    return img.convert("RGBA")
+
+
+def _pil_to_png_bytes(img: Image.Image) -> bytes:
+    """COPIED helper – serialize RGBA PIL image to PNG bytes"""
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _trim_transparent(img: Image.Image, padding=2):
+    """COPIED trim logic used by smart-print-ready"""
+    alpha = np.array(img.getchannel("A"))
+    ys, xs = np.where(alpha > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return img
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+
+    x0 = max(0, x0 - padding)
+    y0 = max(0, y0 - padding)
+    x1 = min(img.width - 1, x1 + padding)
+    y1 = min(img.height - 1, y1 + padding)
+
+    return img.crop((x0, y0, x1 + 1, y1 + 1))
+
+
+# --------------------------------------------------------
+# PRINT-READY COLOR CONVERSION (COPIED)
+# --------------------------------------------------------
+
+def _to_print_ready(img: Image.Image, mode="white"):
+    """
+    COPIED from my.py
+
+    Converts logo into print-ready monochrome
+    while preserving transparency.
+    """
+    rgba = np.array(img, dtype=np.uint8)
+    rgb = rgba[:, :, :3]
+    alpha = rgba[:, :, 3]
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    if mode == "white":
+        out_rgb = np.where(gray[..., None] > 10, 255, 0).astype(np.uint8)
+    else:
+        out_rgb = np.where(gray[..., None] > 10, 0, 255).astype(np.uint8)
+
+    out = np.dstack([out_rgb, alpha])
+    return Image.fromarray(out, "RGBA")
+
 
 # -----------------------------
 # HEALTH (list installed packages)
@@ -1050,6 +1110,77 @@ def remove_bg_endpoint():
         log("exception", success=False, error=str(e))
         return json_error({"error": "Processing failed", "details": str(e), "traceback": tb}, status=500)
 
+
+# --------------------------------------------------------
+# /process-logo  (COPIED ENDPOINT)
+# --------------------------------------------------------
+
+@app.route("/process-logo", methods=["POST"])
+def process_logo():
+    """
+    COPIED FROM my.py (NO LOGIC CHANGES)
+
+    Form-data:
+      - image (required)
+
+    Returns:
+      - processed PNG
+    """
+
+    if "image" not in request.files:
+        return jsonify({"error": "Missing image field"}), 400
+
+    img = _open_image(request.files["image"])
+
+    # Original logic preserved
+    img = _trim_transparent(img, padding=2)
+
+    out_bytes = _pil_to_png_bytes(img)
+
+    return send_file(
+        BytesIO(out_bytes),
+        mimetype="image/png",
+        as_attachment=False,
+        download_name="processed_logo.png"
+    )
+
+
+# --------------------------------------------------------
+# /smart-print-ready  (COPIED ENDPOINT)
+# --------------------------------------------------------
+
+@app.route("/smart-print-ready", methods=["POST"])
+def smart_print_ready():
+    """
+    COPIED FROM my.py (NO LOGIC CHANGES)
+
+    Form-data:
+      - image (required)
+      - print_color: white | black
+    """
+
+    if "image" not in request.files:
+        return jsonify({"error": "Missing image field"}), 400
+
+    print_color = request.form.get("print_color", "white").lower()
+    if print_color not in ("white", "black"):
+        return jsonify({"error": "Invalid print_color"}), 400
+
+    img = _open_image(request.files["image"])
+
+    # Core print-ready conversion (copied)
+    img = _to_print_ready(img, mode=print_color)
+
+    img = _trim_transparent(img, padding=2)
+
+    out_bytes = _pil_to_png_bytes(img)
+
+    return send_file(
+        BytesIO(out_bytes),
+        mimetype="image/png",
+        as_attachment=False,
+        download_name=f"print_ready_{print_color}.png"
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=DEBUG)
