@@ -110,65 +110,171 @@ def has_transparency(img_bytes: bytes) -> bool:
 def _img_bytes_has_transparency(img_bytes: bytes) -> bool:
     return has_transparency(img_bytes)
 
-# --------------------------------------------------------
-# COMMON IMAGE HELPERS (COPIED FROM my.py)
-# --------------------------------------------------------
 
-def _open_image(file_storage):
-    """COPIED from my.py – opens uploaded image safely"""
-    img = Image.open(file_storage.stream)
-    return img.convert("RGBA")
+# -----------------------------
+# NEW UTLS FOR PROCESS-LOGO & SMART-PRINT-READY
+# -----------------------------
 
-
-def _pil_to_png_bytes(img: Image.Image) -> bytes:
-    """COPIED helper – serialize RGBA PIL image to PNG bytes"""
-    buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
-def _trim_transparent(img: Image.Image, padding=2):
-    """COPIED trim logic used by smart-print-ready"""
-    alpha = np.array(img.getchannel("A"))
-    ys, xs = np.where(alpha > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return img
-
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
-
-    x0 = max(0, x0 - padding)
-    y0 = max(0, y0 - padding)
-    x1 = min(img.width - 1, x1 + padding)
-    y1 = min(img.height - 1, y1 + padding)
-
-    return img.crop((x0, y0, x1 + 1, y1 + 1))
-
-
-# --------------------------------------------------------
-# PRINT-READY COLOR CONVERSION (COPIED)
-# --------------------------------------------------------
-
-def _to_print_ready(img: Image.Image, mode="white"):
+def generate_variant(img, current_type):
     """
-    COPIED from my.py
-
-    Converts logo into print-ready monochrome
-    while preserving transparency.
+    Generate color variant (opposite of current type)
+    Uses the same logic as /gen-logo-variant but inline
     """
-    rgba = np.array(img, dtype=np.uint8)
-    rgb = rgba[:, :, :3]
-    alpha = rgba[:, :, 3]
+    img_rgba = img.convert('RGBA')
+    data = np.array(img_rgba)
+    h, w = data.shape[:2]
+    
+    r = data[:, :, 0].astype(np.uint8)
+    g = data[:, :, 1].astype(np.uint8)
+    b = data[:, :, 2].astype(np.uint8)
+    a = data[:, :, 3].astype(np.uint8)
+    
+    # Logo mask (visible pixels)
+    alpha_min = 10
+    logo_mask = a > alpha_min
+    
+    if not np.any(logo_mask):
+        return img_rgba
+    
+    # Thresholds
+    dark_thr = 100
+    white_cut = 220
+    
+    # Detect dark and white pixels in logo
+    blackish = logo_mask & (r < dark_thr) & (g < dark_thr) & (b < dark_thr)
+    whiteish = logo_mask & (r > white_cut) & (g > white_cut) & (b > white_cut)
+    
+    dark_px = int(np.sum(blackish))
+    white_px = int(np.sum(whiteish))
+    logo_px = int(np.sum(logo_mask))
+    
+    dark_ratio = dark_px / max(1, logo_px)
+    white_ratio = white_px / max(1, logo_px)
+    
+    changed = False
+    
+    # Apply transformation based on detected type
+    if current_type == "black" and dark_ratio > 0.1:
+        # Convert dark to white
+        data[blackish, 0] = 255
+        data[blackish, 1] = 255
+        data[blackish, 2] = 255
+        changed = True
+    elif current_type == "white" and white_ratio > 0.1:
+        # Convert white to black
+        data[whiteish, 0] = 0
+        data[whiteish, 1] = 0
+        data[whiteish, 2] = 0
+        changed = True
+    
+    # If no significant change, invert logo colors
+    if not changed:
+        data[logo_mask, 0] = 255 - data[logo_mask, 0]
+        data[logo_mask, 1] = 255 - data[logo_mask, 1]
+        data[logo_mask, 2] = 255 - data[logo_mask, 2]
+    
+    return Image.fromarray(data, 'RGBA')
 
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    if mode == "white":
-        out_rgb = np.where(gray[..., None] > 10, 255, 0).astype(np.uint8)
-    else:
-        out_rgb = np.where(gray[..., None] > 10, 0, 255).astype(np.uint8)
+def _ensure_ftp_dir(ftp: ftplib.FTP, path: str):
+    """
+    Ensure `path` exists on the FTP server and cwd into it.
+    Creates missing segments one by one.
+    Supports paths like: /variant or variant or /a/b/c
+    """
+    if not path:
+        return
 
-    out = np.dstack([out_rgb, alpha])
-    return Image.fromarray(out, "RGBA")
+    # Normalize to segments
+    path = path.strip()
+    is_abs = path.startswith("/")
+    parts = [p for p in path.strip("/").split("/") if p]
+
+    # Go to root for absolute paths (best effort)
+    if is_abs:
+        try:
+            ftp.cwd("/")
+        except ftplib.error_perm:
+            # Some FTP servers don't allow cwd "/" explicitly; ignore.
+            pass
+
+    for part in parts:
+        try:
+            ftp.cwd(part)
+        except ftplib.error_perm:
+            # Create then enter
+            ftp.mkd(part)
+            ftp.cwd(part)
+
+def upload_images_to_ftp(images_dict, folder_id: str):
+    if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
+        return None, "FTP not configured (set FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL)"
+
+    urls = {}
+    try:
+        ftp = ftplib.FTP(FTP_HOST, timeout=30)
+        ftp.login(FTP_USER, FTP_PASS)
+
+        # Ensure base dir exists and cd into it
+        _ensure_ftp_dir(ftp, FTP_DIR)
+
+        # Ensure folder_id exists and cd into it
+        _ensure_ftp_dir(ftp, folder_id)
+
+        base_url = FTP_BASE_URL.rstrip("/")
+
+        for filename, pil_img in images_dict.items():
+            img_buffer = BytesIO()
+            pil_img.save(img_buffer, format="PNG", optimize=True)
+            img_buffer.seek(0)
+
+            ftp.storbinary(f"STOR {filename}", img_buffer)
+
+            # Public URL = base_url + /folder_id/filename
+            # (FTP_DIR is not appended here because FTP_BASE_URL should already represent the public base)
+            urls[filename] = f"{base_url}/{folder_id}/{filename}"
+
+        ftp.quit()
+        return urls, "success"
+
+    except Exception as e:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+        return None, str(e)
+
+
+def get_folder_id_from_request():
+    """
+    Accept folder_id from:
+      1) multipart/form-data: folder_id
+      2) query param: ?folder_id=
+      3) header: X-Folder-Id
+    Falls back to uuid4 if missing.
+
+    Sanitizes to FTP-safe: a-z A-Z 0-9 _ -
+    """
+    raw = (
+        (request.form.get("folder_id") if request.form else None)
+        or request.args.get("folder_id")
+        or request.headers.get("X-Folder-Id")
+        or ""
+    ).strip()
+
+    if not raw:
+        return str(uuid.uuid4())
+
+    # Replace spaces with dashes and remove unsafe chars
+    safe = raw.replace(" ", "-")
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", safe)
+
+    # Avoid empty / weird edge cases after sanitize
+    if not safe:
+        return str(uuid.uuid4())
+
+    # Optional: cap length for sanity
+    return safe[:80]
 
 
 # -----------------------------
@@ -1110,77 +1216,531 @@ def remove_bg_endpoint():
         log("exception", success=False, error=str(e))
         return json_error({"error": "Processing failed", "details": str(e), "traceback": tb}, status=500)
 
-
-# --------------------------------------------------------
-# /process-logo  (COPIED ENDPOINT)
-# --------------------------------------------------------
-
-@app.route("/process-logo", methods=["POST"])
+@app.route('/process-logo', methods=['POST'])
 def process_logo():
     """
-    COPIED FROM my.py (NO LOGIC CHANGES)
-
-    Form-data:
-      - image (required)
-
-    Returns:
-      - processed PNG
+    LOGO PROCESSING PIPELINE (v3) - With FTP Upload
+    
+    Accepts: image (file) - required
+    
+    Pipeline:
+    1. Load image (expects transparent background already)
+    2. Determine logo type (black-ish or white-ish)
+    3. Generate 2 versions:
+       - original_{type}: The original
+       - original_{opposite}: Color variant (inverted)
+    4. Create unique folder and upload both to FTP
+    
+    Returns: JSON with folder_id and image URLs
+    
+    Required Environment Variables for FTP:
+        - FTP_HOST: FTP server hostname
+        - FTP_USER: FTP username
+        - FTP_PASS: FTP password
+        - FTP_DIR: Base remote directory (default: /logos)
+        - FTP_BASE_URL: Public URL base (e.g., https://cdn.example.com)
     """
+    
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+        
+        # Check FTP configuration
+        if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
+            return jsonify({
+                "error": "FTP not configured",
+                "message": "Please set FTP_HOST, FTP_USER, FTP_PASS, and FTP_BASE_URL environment variables"
+            }), 500
+        
+        # Read image bytes
+        image_bytes = file.read()
+        
+        # ✅ folder_id from request (instead of always generating uuid)
+        folder_id = get_folder_id_from_request()
+        
+        # Track processing steps
+        processing_log = []
+        
+        # ============================================================
+        # STEP 1: Load image
+        # ============================================================
+        img = Image.open(BytesIO(image_bytes))
+        img = img.convert('RGBA')
+        
+        processing_log.append({
+            "step": "load_image",
+            "success": True,
+            "size": f"{img.width}x{img.height}"
+        })
+        
+        # ============================================================
+        # STEP 2: Determine logo type
+        # ============================================================
+        logo_type, dark_ratio, light_ratio = determine_logo_type(img)
+        opposite_type = "white" if logo_type == "black" else "black"
+        
+        processing_log.append({
+            "step": "analyze",
+            "detected_type": logo_type,
+            "dark_ratio": f"{dark_ratio:.4f}",
+            "light_ratio": f"{light_ratio:.4f}"
+        })
+        
+        # ============================================================
+        # STEP 3: Generate 2 versions
+        # ============================================================
+        
+        # Original
+        original_key = f"original_{logo_type}"
+        original_img = img.copy()
+        
+        # Variant (opposite color)
+        variant_key = f"original_{opposite_type}"
+        variant_img = generate_variant(img, logo_type)
+        
+        processing_log.append({
+            "step": "generate_versions",
+            "success": True,
+            "versions": [original_key, variant_key]
+        })
+        
+        # ============================================================
+        # STEP 4: Upload to FTP
+        # ============================================================
+        images_to_upload = {
+            f"{original_key}.png": original_img,
+            f"{variant_key}.png": variant_img
+        }
+        
+        urls, ftp_status = upload_images_to_ftp(images_to_upload, folder_id)
+        
+        if urls is None:
+            return jsonify({
+                "error": "FTP upload failed",
+                "message": ftp_status,
+                "processing_log": processing_log
+            }), 500
+        
+        processing_log.append({
+            "step": "ftp_upload",
+            "success": True,
+            "folder_id": folder_id,
+            "files_uploaded": len(urls)
+        })
+        
+        # ============================================================
+        # OUTPUT: JSON with URLs
+        # ============================================================
+        return jsonify({
+            "success": True,
+            "folder_id": folder_id,
+            "detected_type": logo_type,
+            "processing_log": processing_log,
+            "images": {
+                original_key: {
+                    "description": f"Original logo ({logo_type})",
+                    "url": urls[f"{original_key}.png"]
+                },
+                variant_key: {
+                    "description": f"Color variant ({opposite_type})",
+                    "url": urls[f"{variant_key}.png"]
+                }
+            }
+        })
+    
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
-    if "image" not in request.files:
-        return jsonify({"error": "Missing image field"}), 400
 
-    img = _open_image(request.files["image"])
-
-    # Original logic preserved
-    img = _trim_transparent(img, padding=2)
-
-    out_bytes = _pil_to_png_bytes(img)
-
-    return send_file(
-        BytesIO(out_bytes),
-        mimetype="image/png",
-        as_attachment=False,
-        download_name="processed_logo.png"
-    )
-
-
-# --------------------------------------------------------
-# /smart-print-ready  (COPIED ENDPOINT)
-# --------------------------------------------------------
-
-@app.route("/smart-print-ready", methods=["POST"])
+@app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    COPIED FROM my.py (NO LOGIC CHANGES)
+    SMART PRINT-READY (Hybrid v7)
+    - Converts logo to print-ready grayscale (white or black scheme) with transparency preserved.
+    - Handles mixed logos: per connected-component decide Gradient vs Stepped Layers.
+    - Keeps your “group/layer” behavior for solid regions while avoiding ugly banding for gradients.
 
-    Form-data:
-      - image (required)
-      - print_color: white | black
+    Params (form-data):
+    - image: file (required)
+    - print_color: 'white' | 'black' (required)
+    - layers: 'auto' | 2..6 (default: 'auto')         # used for STEPPED components
+    - white_step: 5..30 (default: 10)                 # used for STEPPED components
+    - black_step: 15..50 (default: 33)                # used for STEPPED components
+    - gradient_mode: 'auto' | 'smooth' | 'stepped' (default: 'auto')
+        auto   = detect per component
+        smooth = force all components smooth
+        stepped= force all components stepped
     """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
 
-    if "image" not in request.files:
-        return jsonify({"error": "Missing image field"}), 400
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
 
-    print_color = request.form.get("print_color", "white").lower()
-    if print_color not in ("white", "black"):
-        return jsonify({"error": "Invalid print_color"}), 400
+        file = request.files['image']
+        print_color = request.form.get('print_color', '').lower().strip()
+        num_layers = request.form.get('layers', 'auto')
+        white_step = int(request.form.get('white_step', 10))
+        black_step = int(request.form.get('black_step', 33))
+        gradient_mode = request.form.get('gradient_mode', 'auto').lower().strip()
 
-    img = _open_image(request.files["image"])
+        if print_color not in ['white', 'black']:
+            return jsonify({
+                "error": "print_color is required",
+                "usage": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
+            }), 400
 
-    # Core print-ready conversion (copied)
-    img = _to_print_ready(img, mode=print_color)
+        white_step = max(5, min(30, white_step))
+        black_step = max(15, min(50, black_step))
+        if gradient_mode not in ['auto', 'smooth', 'stepped']:
+            gradient_mode = 'auto'
 
-    img = _trim_transparent(img, padding=2)
+        # ---------------------------
+        # Load image
+        # ---------------------------
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        height, width = data.shape[:2]
 
-    out_bytes = _pil_to_png_bytes(img)
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+        original_alpha = a.copy()
 
-    return send_file(
-        BytesIO(out_bytes),
-        mimetype="image/png",
-        as_attachment=False,
-        download_name=f"print_ready_{print_color}.png"
-    )
+        # ============================================================
+        # STEP 1: BACKGROUND DETECTION (your logic, kept)
+        # ============================================================
+        corners = [
+            data[0, 0],
+            data[0, width - 1],
+            data[height - 1, 0],
+            data[height - 1, width - 1]
+        ]
+
+        corner_colors = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_alphas = np.array([c[3] for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_colors, axis=0)
+        avg_alpha = float(np.mean(corner_alphas))
+        corner_std = float(np.std(corner_colors))
+
+        corners_consistent = corner_std < 30
+
+        if avg_alpha < 128:
+            bg_type = "transparent"
+            bg_mask = original_alpha < 10
+        elif corners_consistent and float(np.mean(avg_corner)) > 240:
+            bg_type = "white"
+            bg_mask = (r > 250) & (g > 250) & (b > 250) & (original_alpha > 200)
+        elif corners_consistent and float(np.mean(avg_corner)) < 15:
+            bg_type = "black"
+            bg_mask = (r < 5) & (g < 5) & (b < 5) & (original_alpha > 200)
+        elif corners_consistent:
+            bg_type = "colored"
+            tolerance = 20
+            bg_mask = (
+                (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                (original_alpha > 200)
+            )
+        else:
+            bg_type = "mixed/none"
+            bg_mask = original_alpha < 10
+
+        # Always treat near-transparent as background
+        bg_mask = bg_mask | (original_alpha < 10)
+
+        # Flood fill from corners for non-transparent backgrounds
+        if bg_type not in ["transparent", "mixed/none"]:
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for start_y, start_x in [(0, 0), (0, width - 1), (height - 1, 0), (height - 1, width - 1)]:
+                if potential_bg[start_y, start_x] > 0:
+                    temp = potential_bg.copy()
+                    flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+                    cv2.floodFill(temp, flood_mask, (start_x, start_y), 128)
+                    connected_bg[temp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        # Logo mask (non-background, but keep alpha relevance)
+        logo_mask = (~bg_mask) & (original_alpha > 10)
+
+        if int(np.sum(logo_mask)) == 0:
+            # fallback: alpha-only
+            logo_mask = original_alpha > 10
+            bg_mask = ~logo_mask
+            bg_type = "fallback-transparent-only"
+
+        # ============================================================
+        # STEP 2: LUMINANCE
+        # ============================================================
+        luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
+
+        logo_luminance = luminance[logo_mask]
+        if logo_luminance.size == 0:
+            return jsonify({"error": "No logo pixels found"}), 400
+
+        lum_min = float(np.min(logo_luminance))
+        lum_max = float(np.max(logo_luminance))
+        lum_range = float(lum_max - lum_min)
+
+        # ============================================================
+        # STEP 3+4: HYBRID PER CONNECTED COMPONENT
+        # ============================================================
+        result = np.zeros((height, width, 4), dtype=np.uint8)
+        result[bg_mask] = [0, 0, 0, 0]
+
+        # Label connected components on logo pixels
+        mask_u8 = (logo_mask.astype(np.uint8) * 255)
+        num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+        def _parse_layers(val):
+            if isinstance(val, str) and val.lower() == 'auto':
+                return 'auto'
+            try:
+                return max(2, min(6, int(val)))
+            except:
+                return 'auto'
+
+        layers_setting = _parse_layers(num_layers)
+
+        # --- gradient detection per component ---
+        def is_gradient_component(comp_bool: np.ndarray) -> bool:
+            # Respect explicit mode
+            if gradient_mode == 'smooth':
+                return True
+            if gradient_mode == 'stepped':
+                return False
+
+            # Remove edges (anti-alias) to avoid false detection
+            k = np.ones((3, 3), np.uint8)
+            interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
+            if interior.sum() < 80:
+                interior = comp_bool  # fallback if too thin
+
+            lum_vals = luminance[interior].astype(np.float32)
+            if lum_vals.size < 140:
+                return False
+
+            # Histogram entropy (smooth gradients -> higher entropy, less dominance)
+            hist = np.histogram(lum_vals, bins=32)[0].astype(np.float32)
+            p = hist / (hist.sum() + 1e-9)
+            entropy = float(-np.sum(p * np.log(p + 1e-9)))
+            norm_entropy = entropy / float(np.log(len(p)))
+            dom_mass = float(np.sort(p)[-3:].sum())     # top-3 bin mass
+            occupancy = int(np.sum(hist > 0))
+
+            # Linear fit: lum ≈ ax + by + c (gradients often fit well)
+            ys, xs = np.where(interior)
+            X = np.column_stack([xs.astype(np.float32), ys.astype(np.float32), np.ones(xs.size, np.float32)])
+            yv = lum_vals
+            coef, *_ = np.linalg.lstsq(X, yv, rcond=None)
+            pred = X @ coef
+            ss_res = float(np.sum((yv - pred) ** 2))
+            ss_tot = float(np.sum((yv - float(yv.mean())) ** 2)) + 1e-9
+            r2 = 1.0 - (ss_res / ss_tot)
+
+            lum_std = float(lum_vals.std())
+            lum_rng = float(lum_vals.max() - lum_vals.min())
+
+            # Decision rules:
+            entropy_gradient = (norm_entropy > 0.70 and dom_mass < 0.55 and occupancy > 10 and lum_rng > 20)
+            linear_gradient = (r2 > 0.60 and lum_std > 8 and lum_rng > 20)
+
+            return bool(entropy_gradient or linear_gradient)
+
+        # Smooth gradient output range (more “solid” by default)
+        # If you want even MORE solid gradients: white 255..235, black 0..25
+        if print_color == 'white':
+            grad_out_max, grad_out_min = 255, 200
+        else:
+            grad_out_min, grad_out_max = 0, 70
+
+        stepped_components = 0
+        gradient_components = 0
+        used_gray_values = set()
+
+        # Process each component
+        for lab in range(1, num_cc):
+            area = int(cc_stats[lab, cv2.CC_STAT_AREA])
+            if area < 25:
+                continue
+
+            comp = (cc_labels == lab) & logo_mask
+            if int(np.sum(comp)) == 0:
+                continue
+
+            component_is_grad = is_gradient_component(comp)
+            if component_is_grad:
+                gradient_components += 1
+            else:
+                stepped_components += 1
+
+            ys, xs = np.where(comp)
+            comp_lum = luminance[ys, xs].astype(np.float32)
+            comp_alpha = original_alpha[ys, xs].astype(np.uint8)
+
+            if component_is_grad:
+                # -------- Smooth mapping (vectorized) --------
+                if lum_range > 1e-6:
+                    norm = (comp_lum - lum_min) / lum_range
+                else:
+                    norm = np.zeros_like(comp_lum)
+
+                # Optional gentle gamma to reduce harsh contrast
+                norm = np.clip(norm, 0.0, 1.0) ** 1.1
+
+                if print_color == 'white':
+                    out = grad_out_max - norm * (grad_out_max - grad_out_min)
+                else:
+                    out = grad_out_min + norm * (grad_out_max - grad_out_min)
+
+                out = np.clip(out, 0, 255).astype(np.uint8)
+
+                result[ys, xs, 0] = out
+                result[ys, xs, 1] = out
+                result[ys, xs, 2] = out
+                result[ys, xs, 3] = comp_alpha
+
+                # track used grays (sampled, to avoid huge sets)
+                if out.size > 0:
+                    used_gray_values.update(np.unique(out[::max(1, out.size // 5000)]).tolist())
+
+            else:
+                # -------- Stepped layers (per component kmeans) --------
+                comp_min = float(comp_lum.min())
+                comp_max = float(comp_lum.max())
+                comp_rng = float(comp_max - comp_min)
+
+                # Decide layers for this component
+                if layers_setting == 'auto':
+                    if comp_rng < 30:
+                        L = 2
+                    elif comp_rng < 80:
+                        L = 3
+                    elif comp_rng < 150:
+                        L = 4
+                    else:
+                        L = 5
+                else:
+                    L = int(layers_setting)
+
+                # If too flat, keep as single tone
+                if comp_rng < 10 or comp_lum.size < L:
+                    L = 1
+                    ranks = np.zeros(comp_lum.size, dtype=np.int32)
+                else:
+                    Z = comp_lum.reshape(-1, 1).astype(np.float32)
+                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+                    _, labels_k, centers = cv2.kmeans(Z, L, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+
+                    order = np.argsort(centers.flatten())  # darkest -> lightest
+                    lut = np.empty(L, dtype=np.int32)
+                    for rank, old in enumerate(order):
+                        lut[int(old)] = rank
+                    ranks = lut[labels_k.flatten()]
+
+                # Build output gray palette for this component
+                if print_color == 'white':
+                    grays = np.empty(L, dtype=np.uint8)
+                    for rank in range(L):
+                        if rank == 0:
+                            grays[rank] = 255
+                        else:
+                            darkness = min(rank * white_step, 50)
+                            v = int(255 * (100 - darkness) / 100)
+                            grays[rank] = max(128, v)
+                else:
+                    grays = np.empty(L, dtype=np.uint8)
+                    for rank in range(L):
+                        if rank == 0:
+                            grays[rank] = 0
+                        else:
+                            lightness = min(rank * black_step, 85)
+                            v = int(255 * lightness / 100)
+                            grays[rank] = min(220, v)
+
+                out = grays[np.clip(ranks, 0, L - 1)].astype(np.uint8)
+
+                result[ys, xs, 0] = out
+                result[ys, xs, 1] = out
+                result[ys, xs, 2] = out
+                result[ys, xs, 3] = comp_alpha
+
+                used_gray_values.update(grays.tolist())
+
+        # Extra safety fallback
+        if int(np.sum(result[:, :, 3] > 0)) == 0:
+            ys, xs = np.where(original_alpha > 10)
+            base = 255 if print_color == 'white' else 0
+            result[ys, xs, 0] = base
+            result[ys, xs, 1] = base
+            result[ys, xs, 2] = base
+            result[ys, xs, 3] = original_alpha[ys, xs]
+            bg_type = bg_type + "|fallback-filled"
+
+        # ============================================================
+        # STEP 5: OUTPUT
+        # ============================================================
+        result_img = Image.fromarray(result, 'RGBA')
+        output = BytesIO()
+        result_img.save(output, format='PNG', optimize=True)
+        output.seek(0)
+
+        used_step = white_step if print_color == 'white' else black_step
+
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'print_ready_{print_color}.png'
+        )
+
+        # Headers for debugging/telemetry
+        response.headers['X-Print-Color'] = print_color.upper()
+        response.headers['X-Background-Type'] = bg_type
+        response.headers['X-Processing-Method'] = "hybrid-components"
+        response.headers['X-Gradient-Mode'] = gradient_mode
+        response.headers['X-Gradient-Components'] = f"{gradient_components}/{max(1, (gradient_components + stepped_components))}"
+        response.headers['X-Stepped-Components'] = str(stepped_components)
+        response.headers['X-Step'] = f"{used_step}%"
+        response.headers['X-Luminance-Range'] = f"{lum_min:.0f}-{lum_max:.0f}"
+
+        # Keep this short so headers don’t explode
+        if used_gray_values:
+            sample = sorted(list(used_gray_values))
+            if len(sample) > 40:
+                sample = sample[:20] + ["..."] + sample[-20:]
+            response.headers['X-Used-Grays'] = str(sample)
+
+        return response
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=DEBUG)
