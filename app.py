@@ -56,7 +56,7 @@ REMBG_SESSION = None
 # -----------------------------
 # RESOLUTION / UPSCALE GUARD
 # -----------------------------
-HIGH_RES_THRESHOLD = int(os.environ.get("HIGH_RES_THRESHOLD", 1200))
+HIGH_RES_THRESHOLD = int(os.environ.get("HIGH_RES_THRESHOLD", 1600))
 
 # -----------------------------
 # AUTH / VALIDATION
