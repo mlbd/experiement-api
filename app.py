@@ -1117,6 +1117,31 @@ def is_high_resolution_pil(img: Image.Image, threshold: int = HIGH_RES_THRESHOLD
     except Exception:
         return False
 
+def downscale_max_side(img: Image.Image, max_side: int = 1000) -> tuple[Image.Image, dict]:
+    """
+    Downscale image so that max(width,height) <= max_side.
+    Never upscales. Keeps aspect ratio. Best for PNG/WebP with alpha.
+    Returns: (img, meta)
+    """
+    img = img.convert("RGBA")
+    w, h = img.size
+    longest = max(w, h)
+
+    if max_side <= 0 or longest <= max_side:
+        return img, {"applied": False, "max_side": int(max_side), "from": f"{w}x{h}", "to": f"{w}x{h}"}
+
+    scale = float(max_side) / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    try:
+        resample = Image.Resampling.LANCZOS
+    except Exception:
+        resample = Image.LANCZOS
+
+    out = img.resize((new_w, new_h), resample=resample)
+    return out, {"applied": True, "max_side": int(max_side), "from": f"{w}x{h}", "to": f"{new_w}x{new_h}"}
+
 
 # -----------------------------
 # /remove-bg (ONLY endpoint)
@@ -1432,6 +1457,11 @@ def remove_bg_endpoint():
             log("trim", success=True, out_size=f"{result_img.width}x{result_img.height}")
         else:
             log("trim", success=True, skipped=True)
+
+        # optional: cap output size (downscale only, never upscale)
+        # hard cap = 1000px longest side
+        result_img, resize_meta = downscale_max_side(result_img, max_side=1000)
+        log("output_resize_cap", success=True, **resize_meta)
 
         # encode
         out = BytesIO()
