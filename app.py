@@ -53,6 +53,10 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 REMBG_MODEL = os.environ.get("REMBG_MODEL", "isnet-general-use")
 REMBG_SESSION = None
 
+# -----------------------------
+# RESOLUTION / UPSCALE GUARD
+# -----------------------------
+HIGH_RES_THRESHOLD = int(os.environ.get("HIGH_RES_THRESHOLD", 1200))
 
 # -----------------------------
 # AUTH / VALIDATION
@@ -1103,6 +1107,16 @@ def get_folder_id_from_request():
     
     return safe[:80]
 
+# -----------------------------
+# RESOLUTION / UPSCALE GUARD
+# -----------------------------
+def is_high_resolution_pil(img: Image.Image, threshold: int = HIGH_RES_THRESHOLD) -> bool:
+    """High-res = longest side >= threshold (default 1200)."""
+    try:
+        return max(int(img.width), int(img.height)) >= int(threshold)
+    except Exception:
+        return False
+
 
 # -----------------------------
 # /remove-bg (ONLY endpoint)
@@ -1121,6 +1135,15 @@ def remove_bg_endpoint():
 
       - bg_remove_with_api: true/false (default false)
         If true, uses fal-ai/birefnet/v2 for background removal (instead of custom methods).
+
+      - enhance_second: true/false (default false)
+      - enhance_second_mode: fal | skip_fal | local (default fal)
+
+    NOTE:
+      Uses your helper:
+        - HIGH_RES_THRESHOLD (default 1200)
+        - is_high_resolution_pil(img, threshold=HIGH_RES_THRESHOLD)
+      If high-res => skip fal/local enhance for both enhance + enhance_second.
     """
     start_time = time.time()
     processing_log = []
@@ -1190,7 +1213,7 @@ def remove_bg_endpoint():
             log("read_params", success=False, reason="invalid_bg_remove", received=bg_remove)
             return json_error({"error": "Invalid bg_remove value", "allowed": sorted(list(allowed_bg))}, status=400)
 
-        # NEW: flag to use BiRefNet API for bg removal
+        # flag to use BiRefNet API for bg removal
         bg_remove_with_api = request.form.get("bg_remove_with_api", "false").lower() == "true"
 
         log(
@@ -1202,6 +1225,7 @@ def remove_bg_endpoint():
             output_format=output_format,
             bg_remove=bg_remove,
             bg_remove_with_api=bg_remove_with_api,
+            enhance_second_mode=enhance_second_mode,
         )
 
         # already transparent?
@@ -1212,14 +1236,48 @@ def remove_bg_endpoint():
             already_transparent = False
             log("check_transparency", success=False, error=str(e), already_transparent=False)
 
-        # optional enhance
+        # resolution check (before any optional fal enhance)
+        try:
+            pre_img = _open_image_bytes(img_bytes)
+            is_high_res = is_high_resolution_pil(pre_img, threshold=HIGH_RES_THRESHOLD)
+            log(
+                "resolution_check",
+                success=True,
+                width=pre_img.width,
+                height=pre_img.height,
+                threshold=int(HIGH_RES_THRESHOLD),
+                is_high_resolution=bool(is_high_res),
+            )
+        except Exception as e:
+            is_high_res = False
+            log(
+                "resolution_check",
+                success=False,
+                error=str(e),
+                threshold=int(HIGH_RES_THRESHOLD),
+                is_high_resolution=False,
+            )
+
+        # optional enhance (skip if already high-res)
         enhanced = False
         enhance_msg = "not requested"
         if do_enhance:
-            enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
-            if enhanced and enhanced_bytes:
-                img_bytes = enhanced_bytes
-            log("enhance_fal", success=True, applied=bool(enhanced), message=str(enhance_msg))
+            if is_high_res:
+                enhanced = False
+                enhance_msg = f"skipped_high_res:{int(HIGH_RES_THRESHOLD)}px"
+                log(
+                    "enhance_fal",
+                    success=True,
+                    applied=False,
+                    skipped=True,
+                    reason="high_resolution",
+                    message=str(enhance_msg),
+                )
+            else:
+                enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
+                if enhanced and enhanced_bytes:
+                    img_bytes = enhanced_bytes
+                log("enhance_fal", success=True, applied=bool(enhanced), message=str(enhance_msg))
 
         # decode
         img = _open_image_bytes(img_bytes)
@@ -1240,7 +1298,6 @@ def remove_bg_endpoint():
                 result_img = img.convert("RGBA")
                 method_used = "skip_requested"
 
-            # NEW: Use fal-ai/birefnet/v2 if requested
             elif bg_remove_with_api:
                 out_bytes, applied, api_msg = remove_bg_birefnet_fal(
                     img_bytes,
@@ -1261,10 +1318,14 @@ def remove_bg_endpoint():
                     # fallback to your existing methods to avoid breaking production
                     fallback_used = True
                     if bg_remove == "color":
-                        result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+                        result_img, meta = remove_bg_color_method_v3(
+                            img, bg_color=analysis.get("bg_color"), tolerance=16
+                        )
                         method_used = "color_v3_forced_fallback"
                     elif bg_remove == "ai":
-                        result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
+                        result_img, meta = remove_bg_ai_method(
+                            img, is_graphic=analysis.get("is_graphic", False)
+                        )
                         method_used = "ai_rembg_forced_fallback"
                     else:
                         result_img, method_used, fb2, meta = remove_bg_auto_v3(img, analysis)
@@ -1314,30 +1375,36 @@ def remove_bg_endpoint():
         if do_enhance_second:
             before_second = result_img.convert("RGBA")
 
-            if enhance_second_mode == "skip_fal":
-                # TEST: don't change image, just run the 2nd-pass cleanup steps
+            # Skip ANY upscaling/enhancing if already high-res
+            if is_high_res:
                 enhanced_second = False
-                enhance_second_msg = "skip_fal_test_mode"
+                enhance_second_msg = f"skipped_high_res:{int(HIGH_RES_THRESHOLD)}px"
                 enh_img = before_second
-
-            elif enhance_second_mode == "local":
-                # TEST: local upscale instead of fal (closest offline test)
-                enh_img, up_meta = local_upscale_for_logo(before_second, target_max=1200)
-                enhanced_second = bool(up_meta.get("applied", False))
-                enhance_second_msg = f"local_upscale:{up_meta}"
-                log("enhance_local_second", success=True, **up_meta)
-
             else:
-                # REAL: call fal
-                tmp_bytes = pil_to_png_bytes(before_second)
-                second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
-
-                if enhanced_second and second_bytes:
-                    enh_img = _open_image_bytes(second_bytes)
-                else:
+                if enhance_second_mode == "skip_fal":
+                    # TEST: don't change image, just run the 2nd-pass cleanup steps
+                    enhanced_second = False
+                    enhance_second_msg = "skip_fal_test_mode"
                     enh_img = before_second
 
-            # Apply the same helper pipeline (even in skip/local mode)
+                elif enhance_second_mode == "local":
+                    # TEST: local upscale instead of fal (closest offline test)
+                    enh_img, up_meta = local_upscale_for_logo(before_second, target_max=1200)
+                    enhanced_second = bool(up_meta.get("applied", False))
+                    enhance_second_msg = f"local_upscale:{up_meta}"
+                    log("enhance_local_second", success=True, **up_meta)
+
+                else:
+                    # REAL: call fal
+                    tmp_bytes = pil_to_png_bytes(before_second)
+                    second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
+
+                    if enhanced_second and second_bytes:
+                        enh_img = _open_image_bytes(second_bytes)
+                    else:
+                        enh_img = before_second
+
+            # Apply the same helper pipeline (even in skip mode)
             result_img = restore_alpha_if_missing(enh_img, before_second)
 
             bg_rgb = analysis.get("bg_color") or (255, 255, 255)
@@ -1402,6 +1469,10 @@ def remove_bg_endpoint():
         resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
         resp.headers["X-Output-Size"] = f"{result_img.width}x{result_img.height}"
 
+        # debug: resolution guard
+        resp.headers["X-High-Resolution"] = str(bool(is_high_res))
+        resp.headers["X-High-Resolution-Threshold"] = str(int(HIGH_RES_THRESHOLD))
+
         return attach_logs_to_response(resp)
 
     except Exception as e:
@@ -1410,6 +1481,7 @@ def remove_bg_endpoint():
         tb = traceback.format_exc()
         log("exception", success=False, error=str(e))
         return json_error({"error": "Processing failed", "details": str(e), "traceback": tb}, status=500)
+
 
 
 
