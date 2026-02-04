@@ -1117,31 +1117,6 @@ def is_high_resolution_pil(img: Image.Image, threshold: int = HIGH_RES_THRESHOLD
     except Exception:
         return False
 
-def downscale_max_side(img: Image.Image, max_side: int = 1000) -> tuple[Image.Image, dict]:
-    """
-    Downscale image so that max(width,height) <= max_side.
-    Never upscales. Keeps aspect ratio. Best for PNG/WebP with alpha.
-    Returns: (img, meta)
-    """
-    img = img.convert("RGBA")
-    w, h = img.size
-    longest = max(w, h)
-
-    if max_side <= 0 or longest <= max_side:
-        return img, {"applied": False, "max_side": int(max_side), "from": f"{w}x{h}", "to": f"{w}x{h}"}
-
-    scale = float(max_side) / float(longest)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
-    try:
-        resample = Image.Resampling.LANCZOS
-    except Exception:
-        resample = Image.LANCZOS
-
-    out = img.resize((new_w, new_h), resample=resample)
-    return out, {"applied": True, "max_side": int(max_side), "from": f"{w}x{h}", "to": f"{new_w}x{new_h}"}
-
 def remove_bg_rembg_api(
     image_bytes: bytes,
     out_format: str = "png",     # "png" or "webp"
@@ -1226,12 +1201,6 @@ def remove_bg_rembg_api(
     return resp.content, True, f"rembg api ok ({out_format})"
 
 
-# -----------------------------
-# /remove-bg (ONLY endpoint)
-# -----------------------------
-# -----------------------------
-# /remove-bg (ONLY endpoint)
-# -----------------------------
 @app.route("/remove-bg", methods=["POST"])
 def remove_bg_endpoint():
     """
@@ -1252,8 +1221,6 @@ def remove_bg_endpoint():
 
     High-res rule:
       If is_high_resolution_pil(img) == True (threshold HIGH_RES_THRESHOLD), skip enhance/upscale steps.
-    Output cap:
-      Always downscale output to max 1000px longest side (never upscale).
     """
     start_time = time.time()
     processing_log = []
@@ -1357,10 +1324,6 @@ def remove_bg_endpoint():
             img0 = trim_transparent(img0, padding=2)
             log("trim_early", success=True, out_size=f"{img0.width}x{img0.height}")
 
-            # keep output cap (never upscale)
-            img0, resize_meta = downscale_max_side(img0, max_side=1000)
-            log("output_resize_cap_early", success=True, **resize_meta)
-
             out = BytesIO()
             if output_format == "webp":
                 img0.save(out, format="WEBP", lossless=True, quality=100, method=6)
@@ -1387,7 +1350,6 @@ def remove_bg_endpoint():
             resp.headers["X-Trimmed"] = "true"
             resp.headers["X-Output-Size"] = f"{img0.width}x{img0.height}"
             resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
-            resp.headers["X-Output-Resize-Cap"] = "1000"
             return attach_logs_to_response(resp)
 
         # resolution check (before any optional fal enhance)
@@ -1420,7 +1382,7 @@ def remove_bg_endpoint():
                     img_bytes = enhanced_bytes
                 log("enhance_fal", success=True, applied=bool(enhanced), message=str(enhance_msg))
 
-                # If fal changed size, refresh high-res status for later stages
+                # refresh high-res status for later stages
                 try:
                     post_enh_img = _open_image_bytes(img_bytes)
                     is_high_res = is_high_resolution_pil(post_enh_img, threshold=HIGH_RES_THRESHOLD)
@@ -1451,7 +1413,6 @@ def remove_bg_endpoint():
             method_used = "skip_requested"
 
         elif bg_remove_with_api:
-            # Use rembg.com API
             out_bytes, applied, api_msg = remove_bg_rembg_api(
                 img_bytes,
                 out_format="png",
@@ -1471,7 +1432,6 @@ def remove_bg_endpoint():
                 method_used = "rembg_api"
                 meta = {"api": "api.rembg.com/rmbg", "message": str(api_msg)}
             else:
-                # fallback to existing methods (production safe)
                 fallback_used = True
                 if bg_remove == "color":
                     result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
@@ -1499,16 +1459,13 @@ def remove_bg_endpoint():
 
         log("bg_removed", success=True, method_used=method_used, fallback_used=fallback_used, meta=meta)
 
-        # feather (small)
         result_img = refine_edges(result_img, feather_amount=2)
         log("refine_edges", success=True)
 
-        # sharpen only when enhanced (upscale softens edges)
         if enhanced:
             result_img = sharpen_rgb_keep_alpha(result_img, amount=1.10, radius=1.2, threshold=3)
             log("sharpen", success=True, amount=1.10, radius=1.2, threshold=3)
 
-        # edge cleanup/decontaminate
         bg_rgb = analysis.get("bg_color") or (255, 255, 255)
         result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
         log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
@@ -1585,10 +1542,6 @@ def remove_bg_endpoint():
         else:
             log("trim", success=True, skipped=True)
 
-        # output resize cap (max 1000px longest side; never upscale)
-        result_img, resize_meta = downscale_max_side(result_img, max_side=1000)
-        log("output_resize_cap", success=True, **resize_meta)
-
         # encode
         out = BytesIO()
         if output_format == "webp":
@@ -1627,7 +1580,6 @@ def remove_bg_endpoint():
 
         resp.headers["X-High-Resolution"] = str(bool(is_high_res))
         resp.headers["X-High-Resolution-Threshold"] = str(int(HIGH_RES_THRESHOLD))
-        resp.headers["X-Output-Resize-Cap"] = "1000"
 
         if bg_remove_with_api:
             resp.headers["X-BgRemove-Api"] = "api.rembg.com/rmbg"
