@@ -1467,8 +1467,8 @@ def remove_bg_endpoint():
             log("sharpen", success=True, amount=1.10, radius=1.2, threshold=3)
 
         bg_rgb = analysis.get("bg_color") or (255, 255, 255)
-        result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
-        log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
+        # result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
+        # log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
 
         result_img = _decontaminate_edges(result_img, bg_rgb)
         log("decontaminate_final", success=True, bg_rgb=bg_rgb)
@@ -1517,8 +1517,8 @@ def remove_bg_endpoint():
             result_img = restore_alpha_if_missing(enh_img, before_second)
 
             bg_rgb = analysis.get("bg_color") or (255, 255, 255)
-            result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
-            log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
+            # result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
+            # log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
 
             result_img = _decontaminate_edges(result_img, bg_rgb)
             log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
